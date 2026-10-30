@@ -1,17 +1,9 @@
 /**
  * ABA PayWay Telegram Group Listener Bridge (listener.mjs)
  * Watches your Telegram Group for @PayWayByABA_bot messages using your personal
- * MTProto session (`Jelly`) and writes parsed payments into Firestore `aba_payments/{trxId}`.
+ * MTProto session and writes parsed payments into Firestore `aba_payments/{trxId}`.
  *
- * INCLUDES:
- * 1. Real-time NewMessage stream (without GramJS's broken string `chats` filter bug)
- * 2. Automatic Startup & 15-Second History Backfill (imports today's existing ៛100 / ៛300 payments immediately!)
- * 3. Full support for `( *232 )` / `( *636 )` spaces inside parentheses and `Solaris.`
- * 4. Built-in HTTP Health-Check Server + Support for FIREBASE_SERVICE_ACCOUNT_JSON env var
- *    so you can deploy 100% FREE 24/7 on Render.com, Koyeb, or Hugging Face Spaces!
- *
- * Run locally on your computer / POS server:
- *   node --env-file=.env listener.mjs
+ * Runs 24/7 in the cloud (Render / Railway / Fly.io) without needing local PC CMD open.
  */
 import http from "node:http";
 import { TelegramClient } from "telegram";
@@ -20,12 +12,20 @@ import { NewMessage } from "telegram/events/index.js";
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-// Supports both Cloud Hosting (via FIREBASE_SERVICE_ACCOUNT_JSON env var) and Local PC (via serviceAccountKey.json)
-const serviceAccountEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+// Supports both Cloud Hosting (via FIREBASE_SERVICE_ACCOUNT or FIREBASE_SERVICE_ACCOUNT_JSON env var) and Local PC
+const serviceAccountEnv = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 if (serviceAccountEnv) {
-  initializeApp({
-    credential: cert(JSON.parse(serviceAccountEnv)),
-  });
+  try {
+    const parsedCreds = typeof serviceAccountEnv === 'string' ? JSON.parse(serviceAccountEnv) : serviceAccountEnv;
+    initializeApp({
+      credential: cert(parsedCreds),
+    });
+  } catch (e) {
+    console.error("Failed to parse Firebase service account JSON from environment:", e.message);
+    initializeApp({
+      credential: applicationDefault(),
+    });
+  }
 } else {
   initializeApp({
     credential: applicationDefault(),
@@ -78,9 +78,6 @@ const apiId = Number(process.env.TG_API_ID);
 const apiHash = String(process.env.TG_API_HASH || "").trim();
 const sessionStr = String(process.env.TG_SESSION || "").trim();
 
-// Supports:
-// 1) Leaving PAYWAY_CHAT_ID= blank (Listens to ALL groups automatically)
-// 2) Comma-separated Chat IDs on a single line: PAYWAY_CHAT_ID=-5129191193,-1003938546235
 const rawTargetChats = String(process.env.PAYWAY_CHAT_ID || "").trim();
 const allowedChatIds = rawTargetChats
   .split(/[\s,|;]+/)
@@ -95,7 +92,7 @@ const isChatAllowed = (chatIdStr) => {
 };
 
 if (!apiId || !apiHash || !sessionStr) {
-  console.error("Missing TG_API_ID, TG_API_HASH, or TG_SESSION in environment.");
+  console.error("Missing TG_API_ID, TG_API_HASH, or TG_SESSION in environment variables.");
   process.exit(1);
 }
 
@@ -130,9 +127,9 @@ const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash,
   connectionRetries: 10,
   retryDelay: 2000,
   autoReconnect: true,
+  useWSS: true,
 });
 
-// Suppress noisy internal GramJS RPC retry warnings while keeping real errors visible
 client.setLogLevel("error");
 
 await client.connect();
@@ -144,7 +141,7 @@ console.log(
 );
 console.log("==================================================================");
 
-// 1. REAL-TIME EVENT LISTENER (Zero extra RPC calls — instant <200ms capture!)
+// 1. REAL-TIME EVENT LISTENER
 client.addEventHandler(async (ev) => {
   try {
     const rawMessage = ev.message?.message || ev.message?.text || "";
@@ -168,7 +165,7 @@ client.addEventHandler(async (ev) => {
   }
 }, new NewMessage({}));
 
-// 1B. RAW MTPROTO UPDATE FALLBACK (Catches group/supergroup messages even if entity cache is cold)
+// 1B. RAW MTPROTO UPDATE FALLBACK
 client.addEventHandler(async (update) => {
   try {
     const msgObj = update?.message;
@@ -190,7 +187,7 @@ client.addEventHandler(async (update) => {
   } catch (err) {}
 });
 
-// 2. LIGHTWEIGHT STARTUP & GENTLE CATCH-UP SWEEP (Prevents Telegram RPCError 500 flooding!)
+// 2. LIGHTWEIGHT STARTUP & CATCH-UP SWEEP
 let cachedTargetDialogs = [];
 let isSweeping = false;
 
@@ -198,7 +195,6 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
   if (isSweeping) return;
   isSweeping = true;
   try {
-    // Only fetch the dialog list once on startup (or if cache is empty) to avoid RPC rate-limiting
     if (isInitialBoot || cachedTargetDialogs.length === 0) {
       const dialogs = await client.getDialogs({ limit: 25 });
       cachedTargetDialogs = dialogs.filter((d) => {
@@ -217,7 +213,6 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
           await saveParsedPaymentToFirestore(parsed, dialogIdStr);
         }
       }
-      // Small 400ms pause between groups so Telegram never throws RPCError
       await new Promise((r) => setTimeout(r, 400));
     }
   } catch (err) {
@@ -229,6 +224,5 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
   }
 }
 
-// Run once on startup to backfill recent payments, then gently every 60 seconds
 await syncRecentGroupHistory(true);
 setInterval(() => syncRecentGroupHistory(false), 60000);
