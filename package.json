@@ -4,8 +4,7 @@
 "description": "",
 "main": "listener.mjs",
 "scripts": {
-"start": "node listener.mjs",
-"test": "echo "Error: no test specified" && exit 1"
+"start": "node listener.mjs"
 },
 "keywords": [],
 "author": "",
