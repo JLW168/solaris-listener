@@ -1,13 +1,17 @@
 /**
- * ABA PayWay Telegram Group Listener Bridge — Multi-Group Dynamic Sync Edition (listener.mjs)
- * Watches ALL configured Telegram Groups for @PayWayByABA_bot notifications (Indoor ABA PAY & Outdoor KHQR)
- * using your MTProto session and pushes parsed payments in parallel to:
+ * ABA PayWay Telegram Group Listener Bridge — Strict Whitelist Edition (listener.mjs)
+ * Watches ONLY explicitly whitelisted Telegram Groups for @PayWayByABA_bot notifications
+ * (Indoor ABA PAY & Outdoor KHQR) using your MTProto session and pushes parsed payments in parallel to:
  *   1. Firestore `system_settings/aba_live_feed` (0ms single-doc real-time stream for POS PaymentModal)
  *   2. Firestore `aba_payments/{trxId}` (persistent transaction ledger & claim guard)
  *   3. Built-in HTTP `/recent`, `/groups`, & `/events` (SSE) endpoints for instant diagnostics
  *
- * NEW FIX: Dynamically merges `process.env.PAYWAY_CHAT_ID` with all `paywayChatId` values configured
- * inside Firestore `shops` and `payway_secrets` collections so newly added branch groups work automatically!
+ * STRICT ISOLATION FIX:
+ *   - Removed auto-adding of unlisted groups (`[UNLISTED GROUP ABA DETECTED - AUTO-ADDING]`).
+ *   - Removed broad title keyword matching (`aba`, `khqr`, `payway`) in Dialog Sweep that pulled in
+ *     groups from other projects (e.g. `-505836809`, `-5129191193`, `-5433742888`).
+ *   - Enforces strict Chat ID matching against `DEFAULT_PAYWAY_CHAT_IDS`, `process.env.PAYWAY_CHAT_ID`,
+ *     and optional Firestore sync (unless `PAYWAY_STRICT_ENV_ONLY=true`).
  */
 import http from "node:http";
 import { TelegramClient } from "telegram";
@@ -46,11 +50,10 @@ function normalizeChatId(idInput) {
     .trim();
 }
 
-// Default built-in list of all 8 Solaris ABA PayWay Telegram Groups (can be extended via .env or Firestore UI)
+// Default built-in list of strictly allowed Solaris ABA PayWay Telegram Groups
 const DEFAULT_PAYWAY_CHAT_IDS = [
-  "-1003938546235",
-  "-1003861176164",
- 
+  "-1003938546235", // SLR-BSL
+  "-1003861176164", // SLR•OTH
 ];
 
 const rawEnvTargetChats = String(process.env.PAYWAY_CHAT_ID || "").trim();
@@ -69,15 +72,18 @@ function registerAllowedChatIdsFromString(rawStr) {
 registerAllowedChatIdsFromString(DEFAULT_PAYWAY_CHAT_IDS.join(","));
 registerAllowedChatIdsFromString(rawEnvTargetChats);
 
-// Dynamically sync `paywayChatId` from Firestore `shops` and `payway_secrets` so UI changes take effect without restarting
+// Optional dynamic sync from Firestore `shops` and `payway_secrets`
+// Set PAYWAY_STRICT_ENV_ONLY=true in Render if you want to ignore Firestore Chat IDs completely
 async function syncAllowedChatIdsFromFirestore() {
+  if (String(process.env.PAYWAY_STRICT_ENV_ONLY || "").toLowerCase() === "true") {
+    return;
+  }
   try {
     const [shopsSnap, secretsSnap] = await Promise.all([
       db.collection("shops").get().catch(() => null),
       db.collection("payway_secrets").get().catch(() => null),
     ]);
 
-    let addedCount = 0;
     const beforeSize = allowedChatIdsSet.size;
 
     if (shopsSnap) {
@@ -99,7 +105,7 @@ async function syncAllowedChatIdsFromFirestore() {
       });
     }
 
-    addedCount = allowedChatIdsSet.size - beforeSize;
+    const addedCount = allowedChatIdsSet.size - beforeSize;
     if (addedCount > 0) {
       console.log(
         `🔄 Synced +${addedCount} new PayWay Chat ID(s) from Firestore! Total watched groups: ${allowedChatIdsSet.size}`
@@ -111,14 +117,13 @@ async function syncAllowedChatIdsFromFirestore() {
   }
 }
 
+// Strict Whitelist Verification: Rejects any empty or unlisted Chat ID
 const isChatAllowed = (chatIdStr) => {
-  // If user explicitly sets PAYWAY_ALLOW_ALL_GROUPS=true, accept valid ABA PayWay messages from any group
   if (String(process.env.PAYWAY_ALLOW_ALL_GROUPS || "").toLowerCase() === "true") {
     return true;
   }
-  if (allowedChatIdsSet.size === 0) return true;
   const stripped = normalizeChatId(chatIdStr);
-  if (!stripped) return true;
+  if (!stripped) return false;
   return allowedChatIdsSet.has(stripped);
 };
 
@@ -201,7 +206,7 @@ http
     res.end(
       JSON.stringify({
         status: "ok",
-        service: "solaris-aba-listener-v2.1-multigroup",
+        service: "solaris-aba-listener-v2.2-strict-whitelist",
         uptimeSeconds: Math.round(process.uptime()),
         watchedChatIdsCount: allowedChatIdsSet.size,
         watchedChatIds: Array.from(allowedChatIdsSet),
@@ -314,6 +319,12 @@ const savedTrxMemory = new Set();
 // 7. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
 async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
   if (!parsed || !parsed.trxId) return false;
+
+  // Final strict guard before writing to Firestore
+  if (!isChatAllowed(chatIdStr)) {
+    return false;
+  }
+
   const trxId = String(parsed.trxId).trim();
 
   if (savedTrxMemory.has(trxId)) return false;
@@ -373,14 +384,14 @@ client.setLogLevel("error");
 
 await client.connect();
 console.log("==================================================================");
-console.log("⚡ Connected to Telegram MTProto (Ultra-Fast Multi-Group Mode)!");
+console.log("⚡ Connected to Telegram MTProto (Strict Whitelist Multi-Group Mode)!");
 console.log(
-  `   Watching ${allowedChatIdsSet.size} Normalized PayWay Chat ID(s):`,
+  `   Strictly Watching ${allowedChatIdsSet.size} Normalized PayWay Chat ID(s):`,
   Array.from(allowedChatIdsSet).join(", ")
 );
 console.log("==================================================================");
 
-// 9A. REAL-TIME EVENT LISTENER
+// 9A. REAL-TIME EVENT LISTENER (Strictly ignores unlisted groups)
 client.addEventHandler(async (ev) => {
   try {
     const rawMessage = ev.message?.message || ev.message?.text || "";
@@ -394,21 +405,17 @@ client.addEventHandler(async (ev) => {
 
     const incomingChatId = String(rawPeerId || "");
 
+    // Strictly ignore any group not in our allowed whitelist
+    if (!isChatAllowed(incomingChatId)) return;
+
     const parsed = parseABAPayWay(rawMessage, Date.now());
     if (!parsed) return;
-
-    if (!isChatAllowed(incomingChatId)) {
-      console.log(
-        `ℹ️ [UNLISTED GROUP ABA DETECTED - AUTO-ADDING] Chat ID: ${incomingChatId} | Trx: ${parsed.trxId}`
-      );
-      registerAllowedChatIdsFromString(incomingChatId);
-    }
 
     await saveParsedPaymentToFirestore(parsed, incomingChatId);
   } catch (err) {}
 }, new NewMessage({}));
 
-// 9B. RAW MTPROTO UPDATE FALLBACK
+// 9B. RAW MTPROTO UPDATE FALLBACK (Strictly ignores unlisted groups)
 client.addEventHandler(async (update) => {
   try {
     const msgObj = update?.message || update?.newMessage?.message;
@@ -422,18 +429,17 @@ client.addEventHandler(async (update) => {
       ? `-${peer.chatId}`
       : "";
 
+    // Strictly ignore any group not in our allowed whitelist
+    if (!isChatAllowed(rawPeerId)) return;
+
     const parsed = parseABAPayWay(rawText, Date.now());
     if (!parsed) return;
-
-    if (!isChatAllowed(rawPeerId)) {
-      registerAllowedChatIdsFromString(rawPeerId);
-    }
 
     await saveParsedPaymentToFirestore(parsed, rawPeerId);
   } catch (err) {}
 });
 
-// 10. FAST PARALLEL MULTI-GROUP SWEEP (Scans up to 100 dialogs so all 8+ groups are always included!)
+// 10. FAST PARALLEL MULTI-GROUP SWEEP (Strictly scans ONLY whitelisted Chat IDs)
 let cachedTargetDialogs = [];
 let lastDialogRefreshMs = 0;
 let isSweeping = false;
@@ -443,24 +449,17 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
   isSweeping = true;
   try {
     const now = Date.now();
-    // Refresh dialog list every 3 minutes or on boot (increased limit from 20 -> 100 so no PayWay group is missed!)
+    // Refresh dialog list every 3 minutes or on boot
     if (isInitialBoot || cachedTargetDialogs.length === 0 || now - lastDialogRefreshMs > 180000) {
       const dialogs = await client.getDialogs({ limit: 100 });
       cachedTargetDialogs = dialogs.filter((d) => {
         const dialogIdStr = String(d.id || "");
-        const titleLower = String(d.title || d.name || "").toLowerCase();
-        const isKeywordMatch =
-          titleLower.includes("khqr") ||
-          titleLower.includes("payway") ||
-          titleLower.includes("aba") ||
-          titleLower.includes("slr") ||
-          titleLower.includes("solaris");
-        return (d.isGroup || d.isChannel) && (isChatAllowed(dialogIdStr) || isKeywordMatch);
+        return (d.isGroup || d.isChannel) && isChatAllowed(dialogIdStr);
       });
       lastDialogRefreshMs = now;
       if (isInitialBoot) {
         console.log(
-          `📡 Active Dialog Sweep locked onto ${cachedTargetDialogs.length} Telegram Group(s):`,
+          `📡 Active Dialog Sweep strictly locked onto ${cachedTargetDialogs.length} Whitelisted Group(s):`,
           cachedTargetDialogs.map((d) => `${d.title} (${d.id})`).join(" | ")
         );
       }
@@ -470,6 +469,8 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
       cachedTargetDialogs.map(async (d) => {
         try {
           const dialogIdStr = String(d.id || "");
+          if (!isChatAllowed(dialogIdStr)) return;
+
           const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 12 : 4 });
           for (const msg of messages) {
             const text = msg?.message || msg?.text || "";
