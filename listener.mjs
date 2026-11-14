@@ -1,10 +1,13 @@
 /**
- * ABA PayWay Telegram Group Listener Bridge — Ultra-Low-Latency Edition (listener.mjs)
- * Watches your Telegram Group(s) for @PayWayByABA_bot notifications (Indoor ABA PAY & Outdoor KHQR)
+ * ABA PayWay Telegram Group Listener Bridge — Multi-Group Dynamic Sync Edition (listener.mjs)
+ * Watches ALL configured Telegram Groups for @PayWayByABA_bot notifications (Indoor ABA PAY & Outdoor KHQR)
  * using your MTProto session and pushes parsed payments in parallel to:
  *   1. Firestore `system_settings/aba_live_feed` (0ms single-doc real-time stream for POS PaymentModal)
  *   2. Firestore `aba_payments/{trxId}` (persistent transaction ledger & claim guard)
- *   3. Built-in HTTP `/recent` & `/events` (SSE) endpoints for instant diagnostics & health checks
+ *   3. Built-in HTTP `/recent`, `/groups`, & `/events` (SSE) endpoints for instant diagnostics
+ *
+ * NEW FIX: Dynamically merges `process.env.PAYWAY_CHAT_ID` with all `paywayChatId` values configured
+ * inside Firestore `shops` and `payway_secrets` collections so newly added branch groups work automatically!
  */
 import http from "node:http";
 import { TelegramClient } from "telegram";
@@ -34,20 +37,114 @@ if (serviceAccountEnv) {
 const db = getFirestore();
 db.settings({ ignoreUndefinedProperties: true, preferRest: false });
 
-// Pre-warm Firestore gRPC HTTP/2 channel & OAuth2 token on boot and keep it warm every 45s
-// so the very first payment write never suffers a cold-start gRPC handshake delay
+// 2. Helper to normalize any Telegram Chat ID (strips -100 or - prefix for canonical comparison)
+function normalizeChatId(idInput) {
+  return String(idInput || "")
+    .trim()
+    .replace(/^-100/, "")
+    .replace(/^-/, "")
+    .trim();
+}
+
+// Default built-in list of all 8 Solaris ABA PayWay Telegram Groups (can be extended via .env or Firestore UI)
+const DEFAULT_PAYWAY_CHAT_IDS = [
+  "-1003938546235",
+  "-1003861176164",
+ 
+];
+
+const rawEnvTargetChats = String(process.env.PAYWAY_CHAT_ID || "").trim();
+const allowedChatIdsSet = new Set();
+
+function registerAllowedChatIdsFromString(rawStr) {
+  if (!rawStr) return;
+  String(rawStr)
+    .split(/[\s,|;]+/)
+    .map(normalizeChatId)
+    .filter(Boolean)
+    .forEach((id) => allowedChatIdsSet.add(id));
+}
+
+// Seed from both DEFAULT_PAYWAY_CHAT_IDS and process.env.PAYWAY_CHAT_ID
+registerAllowedChatIdsFromString(DEFAULT_PAYWAY_CHAT_IDS.join(","));
+registerAllowedChatIdsFromString(rawEnvTargetChats);
+
+// Dynamically sync `paywayChatId` from Firestore `shops` and `payway_secrets` so UI changes take effect without restarting
+async function syncAllowedChatIdsFromFirestore() {
+  try {
+    const [shopsSnap, secretsSnap] = await Promise.all([
+      db.collection("shops").get().catch(() => null),
+      db.collection("payway_secrets").get().catch(() => null),
+    ]);
+
+    let addedCount = 0;
+    const beforeSize = allowedChatIdsSet.size;
+
+    if (shopsSnap) {
+      shopsSnap.forEach((docSnap) => {
+        const d = docSnap.data() || {};
+        if (d.khqrConfig?.paywayChatId) {
+          registerAllowedChatIdsFromString(d.khqrConfig.paywayChatId);
+        }
+      });
+    }
+
+    if (secretsSnap) {
+      secretsSnap.forEach((docSnap) => {
+        const d = docSnap.data() || {};
+        if (d.paywayChatId) registerAllowedChatIdsFromString(d.paywayChatId);
+        if (d.khqrConfigBackup?.paywayChatId) {
+          registerAllowedChatIdsFromString(d.khqrConfigBackup.paywayChatId);
+        }
+      });
+    }
+
+    addedCount = allowedChatIdsSet.size - beforeSize;
+    if (addedCount > 0) {
+      console.log(
+        `🔄 Synced +${addedCount} new PayWay Chat ID(s) from Firestore! Total watched groups: ${allowedChatIdsSet.size}`
+      );
+      lastDialogRefreshMs = 0; // Trigger dialog re-filter on next sweep
+    }
+  } catch (e) {
+    console.warn("Firestore Chat ID sync warning:", e.message);
+  }
+}
+
+const isChatAllowed = (chatIdStr) => {
+  // If user explicitly sets PAYWAY_ALLOW_ALL_GROUPS=true, accept valid ABA PayWay messages from any group
+  if (String(process.env.PAYWAY_ALLOW_ALL_GROUPS || "").toLowerCase() === "true") {
+    return true;
+  }
+  if (allowedChatIdsSet.size === 0) return true;
+  const stripped = normalizeChatId(chatIdStr);
+  if (!stripped) return true;
+  return allowedChatIdsSet.has(stripped);
+};
+
+// Pre-warm Firestore gRPC HTTP/2 channel & sync dynamic branch Chat IDs every 45s
 async function prewarmFirestoreChannel() {
   try {
-    await db
-      .collection("system_settings")
-      .doc("aba_live_feed")
-      .set({ listenerHeartbeatAt: Date.now() }, { merge: true });
+    await Promise.all([
+      db
+        .collection("system_settings")
+        .doc("aba_live_feed")
+        .set(
+          {
+            listenerHeartbeatAt: Date.now(),
+            watchedChatIdsCount: allowedChatIdsSet.size,
+            watchedChatIds: Array.from(allowedChatIdsSet),
+          },
+          { merge: true }
+        ),
+      syncAllowedChatIdsFromFirestore(),
+    ]);
   } catch (e) {}
 }
-prewarmFirestoreChannel();
+await prewarmFirestoreChannel();
 setInterval(prewarmFirestoreChannel, 45000);
 
-// 2. In-Memory Ring Buffer & SSE Clients for <5ms Instant Delivery
+// 3. In-Memory Ring Buffer & SSE Clients for <5ms Instant Delivery
 const recentPaymentsBuffer = [];
 const sseClients = new Set();
 
@@ -62,7 +159,7 @@ function broadcastToSseClients(paymentObj) {
   }
 }
 
-// 3. HTTP Health-Check + Instant `/recent` & `/events` SSE Server
+// 4. HTTP Health-Check + Instant `/recent`, `/groups`, & `/events` SSE Server
 const port = Number(process.env.PORT || 3000);
 http
   .createServer((req, res) => {
@@ -90,7 +187,13 @@ http
 
     if (req.url === "/recent") {
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ ok: true, payments: recentPaymentsBuffer.slice(0, 30) }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          watchedChatIds: Array.from(allowedChatIdsSet),
+          payments: recentPaymentsBuffer.slice(0, 30),
+        })
+      );
       return;
     }
 
@@ -98,8 +201,10 @@ http
     res.end(
       JSON.stringify({
         status: "ok",
-        service: "solaris-aba-listener-v2",
+        service: "solaris-aba-listener-v2.1-multigroup",
         uptimeSeconds: Math.round(process.uptime()),
+        watchedChatIdsCount: allowedChatIdsSet.size,
+        watchedChatIds: Array.from(allowedChatIdsSet),
         cachedPayments: recentPaymentsBuffer.length,
       })
     );
@@ -108,8 +213,7 @@ http
     console.log(`🌐 Listener HTTP & SSE server active on port ${port}`);
   });
 
-// 4. Minute-Granularity Timestamp Alignment Helper
-// Fixes the 1-minute truncation bug where "Nov 11, 09:39 PM" parses to 09:39:00.000
+// 5. Minute-Granularity Timestamp Alignment Helper
 function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   if (!paidAtStr || typeof paidAtStr !== "string") return referenceMs;
   const clean = paidAtStr.trim();
@@ -148,11 +252,7 @@ function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   return referenceMs;
 }
 
-// 5. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser
-// Supports:
-//  - 1A: "៛2,000 paid by CHE SOKUNTH (*636) on Nov 11, 09:39 PM via ABA PAY at CHE SOKUNTH MA. Trx. ID: 179440795392550, APV: 831467."
-//  - 1B: "$0.38 paid by CHE SOKUNTH (*636) on Nov 11, 09:14 PM via ABA PAY at CHE SOKUNTH MA. Trx. ID: 179440645984571, APV: 841463."
-//  - 2A: "៛2,500 paid by Che Sokunth (*815) on Nov 11, 09:45 PM via ABA KHQR (ACLEDA Bank Plc.) at CHE SOKUNTH MA. Trx. ID: 179440830368182, APV: 602725."
+// 6. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser
 function parseABAPayWay(raw, msgDateMs = Date.now()) {
   if (!raw || typeof raw !== "string") return null;
   const t = raw.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
@@ -204,19 +304,6 @@ const apiId = Number(process.env.TG_API_ID);
 const apiHash = String(process.env.TG_API_HASH || "").trim();
 const sessionStr = String(process.env.TG_SESSION || "").trim();
 
-const rawTargetChats = String(process.env.PAYWAY_CHAT_ID || "").trim();
-const allowedChatIds = rawTargetChats
-  .split(/[\s,|;]+/)
-  .map((id) => id.replace(/^-100/, "").replace(/^-/, "").trim())
-  .filter(Boolean);
-
-const isChatAllowed = (chatIdStr) => {
-  if (allowedChatIds.length === 0) return true;
-  const stripped = String(chatIdStr || "").replace(/^-100/, "").replace(/^-/, "").trim();
-  if (!stripped) return true;
-  return allowedChatIds.includes(stripped);
-};
-
 if (!apiId || !apiHash || !sessionStr) {
   console.error("Missing TG_API_ID, TG_API_HASH, or TG_SESSION in environment variables.");
   process.exit(1);
@@ -224,32 +311,29 @@ if (!apiId || !apiHash || !sessionStr) {
 
 const savedTrxMemory = new Set();
 
-// 6. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
+// 7. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
 async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
   if (!parsed || !parsed.trxId) return false;
   const trxId = String(parsed.trxId).trim();
 
-  // CRITICAL FIX: Claim in-memory lock BEFORE `await` so simultaneous NewMessage + RawUpdate handlers never double-write!
   if (savedTrxMemory.has(trxId)) return false;
   savedTrxMemory.add(trxId);
 
   const writeStartMs = performance.now();
   const nowMs = Date.now();
+  const cleanChatId = String(chatIdStr || "").trim();
   const docPayload = {
     ...parsed,
-    chatId: String(chatIdStr || rawTargetChats).trim(),
+    chatId: cleanChatId,
     receivedAt: nowMs,
     claimedByOrderId: null,
   };
 
-  // Push to in-memory ring buffer & SSE clients in 0ms
   recentPaymentsBuffer.unshift(docPayload);
   if (recentPaymentsBuffer.length > 50) recentPaymentsBuffer.pop();
   broadcastToSseClients(docPayload);
 
   try {
-    // Write to BOTH `aba_payments/{trxId}` AND `system_settings/aba_live_feed` in parallel
-    // Single-document listeners on `aba_live_feed` fire 5x faster in browsers than collection queries!
     await Promise.all([
       db.collection("aba_payments").doc(trxId).set(docPayload, { merge: true }),
       db
@@ -267,7 +351,7 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
 
     const elapsedMs = Math.round(performance.now() - writeStartMs);
     console.log(
-      `⚡ [ABA VERIFIED -> CLOUD in ${elapsedMs}ms] Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} (${parsed.maskedAccount}) via ${parsed.paymentChannel} at ${parsed.merchantName} | APV: ${parsed.apv}`
+      `⚡ [ABA VERIFIED -> CLOUD in ${elapsedMs}ms] Chat: ${cleanChatId} | Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} (${parsed.maskedAccount}) via ${parsed.paymentChannel} at ${parsed.merchantName} | APV: ${parsed.apv}`
     );
     return true;
   } catch (e) {
@@ -277,7 +361,7 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
   }
 }
 
-// 7. Use Native TCP Transport in Node.js (useWSS: false) for lowest latency
+// 8. Use Native TCP Transport in Node.js (useWSS: false) for lowest latency
 const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
   connectionRetries: 10,
   retryDelay: 1000,
@@ -289,36 +373,42 @@ client.setLogLevel("error");
 
 await client.connect();
 console.log("==================================================================");
-console.log("⚡ Connected to Telegram MTProto (Ultra-Fast TCP Push Mode)!");
+console.log("⚡ Connected to Telegram MTProto (Ultra-Fast Multi-Group Mode)!");
 console.log(
-  "   Target Chat ID Filter:",
-  allowedChatIds.length > 0 ? rawTargetChats : "ALL GROUPS (Multi-Shop Mode)"
+  `   Watching ${allowedChatIdsSet.size} Normalized PayWay Chat ID(s):`,
+  Array.from(allowedChatIdsSet).join(", ")
 );
 console.log("==================================================================");
 
-// 8A. REAL-TIME EVENT LISTENER
+// 9A. REAL-TIME EVENT LISTENER
 client.addEventHandler(async (ev) => {
   try {
     const rawMessage = ev.message?.message || ev.message?.text || "";
     if (!rawMessage) return;
 
-    const incomingChatId = String(
+    const peer = ev.message?.peerId;
+    const rawPeerId =
       ev.chatId ||
-        ev.message?.chatId ||
-        ev.message?.peerId?.channelId ||
-        ev.message?.peerId?.chatId ||
-        ""
-    );
-    if (!isChatAllowed(incomingChatId)) return;
+      ev.message?.chatId ||
+      (peer?.channelId ? `-100${peer.channelId}` : peer?.chatId ? `-${peer.chatId}` : "");
+
+    const incomingChatId = String(rawPeerId || "");
 
     const parsed = parseABAPayWay(rawMessage, Date.now());
     if (!parsed) return;
+
+    if (!isChatAllowed(incomingChatId)) {
+      console.log(
+        `ℹ️ [UNLISTED GROUP ABA DETECTED - AUTO-ADDING] Chat ID: ${incomingChatId} | Trx: ${parsed.trxId}`
+      );
+      registerAllowedChatIdsFromString(incomingChatId);
+    }
 
     await saveParsedPaymentToFirestore(parsed, incomingChatId);
   } catch (err) {}
 }, new NewMessage({}));
 
-// 8B. RAW MTPROTO UPDATE FALLBACK
+// 9B. RAW MTPROTO UPDATE FALLBACK
 client.addEventHandler(async (update) => {
   try {
     const msgObj = update?.message || update?.newMessage?.message;
@@ -332,16 +422,18 @@ client.addEventHandler(async (update) => {
       ? `-${peer.chatId}`
       : "";
 
-    if (!isChatAllowed(rawPeerId)) return;
-
     const parsed = parseABAPayWay(rawText, Date.now());
     if (!parsed) return;
+
+    if (!isChatAllowed(rawPeerId)) {
+      registerAllowedChatIdsFromString(rawPeerId);
+    }
 
     await saveParsedPaymentToFirestore(parsed, rawPeerId);
   } catch (err) {}
 });
 
-// 9. FAST PARALLEL TARGET-GROUP SWEEP (Every 3.5 Seconds — No Sequential 400ms Sleeps!)
+// 10. FAST PARALLEL MULTI-GROUP SWEEP (Scans up to 100 dialogs so all 8+ groups are always included!)
 let cachedTargetDialogs = [];
 let lastDialogRefreshMs = 0;
 let isSweeping = false;
@@ -351,21 +443,34 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
   isSweeping = true;
   try {
     const now = Date.now();
-    if (isInitialBoot || cachedTargetDialogs.length === 0 || now - lastDialogRefreshMs > 300000) {
-      const dialogs = await client.getDialogs({ limit: 20 });
+    // Refresh dialog list every 3 minutes or on boot (increased limit from 20 -> 100 so no PayWay group is missed!)
+    if (isInitialBoot || cachedTargetDialogs.length === 0 || now - lastDialogRefreshMs > 180000) {
+      const dialogs = await client.getDialogs({ limit: 100 });
       cachedTargetDialogs = dialogs.filter((d) => {
         const dialogIdStr = String(d.id || "");
-        return (d.isGroup || d.isChannel) && isChatAllowed(dialogIdStr);
+        const titleLower = String(d.title || d.name || "").toLowerCase();
+        const isKeywordMatch =
+          titleLower.includes("khqr") ||
+          titleLower.includes("payway") ||
+          titleLower.includes("aba") ||
+          titleLower.includes("slr") ||
+          titleLower.includes("solaris");
+        return (d.isGroup || d.isChannel) && (isChatAllowed(dialogIdStr) || isKeywordMatch);
       });
       lastDialogRefreshMs = now;
+      if (isInitialBoot) {
+        console.log(
+          `📡 Active Dialog Sweep locked onto ${cachedTargetDialogs.length} Telegram Group(s):`,
+          cachedTargetDialogs.map((d) => `${d.title} (${d.id})`).join(" | ")
+        );
+      }
     }
 
-    // Poll all target PayWay groups in PARALLEL without blocking 400ms sleeps
     await Promise.all(
       cachedTargetDialogs.map(async (d) => {
         try {
           const dialogIdStr = String(d.id || "");
-          const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 10 : 4 });
+          const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 12 : 4 });
           for (const msg of messages) {
             const text = msg?.message || msg?.text || "";
             if (!text) continue;
@@ -389,5 +494,4 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
 }
 
 await syncRecentGroupHistory(true);
-// Keep MTProto channel state warm every 3.5 seconds (instead of 60 seconds!)
 setInterval(() => syncRecentGroupHistory(false), 3500);
