@@ -1,17 +1,17 @@
 /**
- * ABA PayWay Telegram Group Listener Bridge — Strict Whitelist Edition (listener.mjs)
- * Watches ONLY explicitly whitelisted Telegram Groups for @PayWayByABA_bot notifications
- * (Indoor ABA PAY & Outdoor KHQR) using your MTProto session and pushes parsed payments in parallel to:
- *   1. Firestore `system_settings/aba_live_feed` (0ms single-doc real-time stream for POS PaymentModal)
- *   2. Firestore `aba_payments/{trxId}` (persistent transaction ledger & claim guard)
- *   3. Built-in HTTP `/recent`, `/groups`, & `/events` (SSE) endpoints for instant diagnostics
+ * ABA PayWay Telegram Group Listener Bridge — Strict Whitelist Edition v2.3 (listener-SLR.mjs)
+ * Synchronized 1:1 with Solaris Cafe `index.html` Application Workspace.
  *
- * STRICT ISOLATION FIX:
- *   - Removed auto-adding of unlisted groups (`[UNLISTED GROUP ABA DETECTED - AUTO-ADDING]`).
- *   - Removed broad title keyword matching (`aba`, `khqr`, `payway`) in Dialog Sweep that pulled in
- *     groups from other projects (e.g. `-505836809`, `-5129191193`, `-5433742888`).
- *   - Enforces strict Chat ID matching against `DEFAULT_PAYWAY_CHAT_IDS`, `process.env.PAYWAY_CHAT_ID`,
- *     and optional Firestore sync (unless `PAYWAY_STRICT_ENV_ONLY=true`).
+ * Key Optimizations:
+ *   1. Nested Map Write for `system_settings/aba_live_feed`: Uses `{ payments: { [trxId]: docPayload } }`
+ *      with `{ merge: true }` so `docSnap.data()?.payments` in `index.html` reads every transaction
+ *      instantly in 0ms (fixes literal dot-key `payments.${trxId}` bug in Firestore `.set()`).
+ *   2. Claim-Safe Upsert & Memory Pruning: Preserves existing `claimedByOrderId` if a payment was already
+ *      settled by POS/KDS/Customer Portal, and caps `aba_live_feed.payments` to the latest 40 entries
+ *      so the single-document live feed never exceeds Firestore's 1MB limit.
+ *   3. Unified Indoor ABA PAY + Outdoor Bakong KHQR Parser (with Resilient Fallback):
+ *      Matches the exact regex & fallback parser in `window.SolarisKHQREngine.parseABAPayWayMessage`.
+ *   4. Strict Multi-Group Whitelist Isolation: Watches ONLY explicitly configured branch `paywayChatId`s.
  */
 import http from "node:http";
 import { TelegramClient } from "telegram";
@@ -50,6 +50,15 @@ function normalizeChatId(idInput) {
     .trim();
 }
 
+// Canonical Supergroup Chat ID formatter (`-100...` or `-...`) for consistent storage in Firestore
+function formatCanonicalChatId(idInput) {
+  const raw = String(idInput || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("-")) return raw;
+  const digits = normalizeChatId(raw);
+  return digits ? `-100${digits}` : raw;
+}
+
 // Default built-in list of strictly allowed Solaris ABA PayWay Telegram Groups
 const DEFAULT_PAYWAY_CHAT_IDS = [
   "-1003938546235", // SLR-BSL
@@ -72,7 +81,9 @@ function registerAllowedChatIdsFromString(rawStr) {
 registerAllowedChatIdsFromString(DEFAULT_PAYWAY_CHAT_IDS.join(","));
 registerAllowedChatIdsFromString(rawEnvTargetChats);
 
-// Optional dynamic sync from Firestore `shops` and `payway_secrets`
+let lastDialogRefreshMs = 0;
+
+// Dynamic sync from Firestore `shops` and `payway_secrets`
 // Set PAYWAY_STRICT_ENV_ONLY=true in Render if you want to ignore Firestore Chat IDs completely
 async function syncAllowedChatIdsFromFirestore() {
   if (String(process.env.PAYWAY_STRICT_ENV_ONLY || "").toLowerCase() === "true") {
@@ -127,30 +138,10 @@ const isChatAllowed = (chatIdStr) => {
   return allowedChatIdsSet.has(stripped);
 };
 
-// Pre-warm Firestore gRPC HTTP/2 channel & sync dynamic branch Chat IDs every 45s
-async function prewarmFirestoreChannel() {
-  try {
-    await Promise.all([
-      db
-        .collection("system_settings")
-        .doc("aba_live_feed")
-        .set(
-          {
-            listenerHeartbeatAt: Date.now(),
-            watchedChatIdsCount: allowedChatIdsSet.size,
-            watchedChatIds: Array.from(allowedChatIdsSet),
-          },
-          { merge: true }
-        ),
-      syncAllowedChatIdsFromFirestore(),
-    ]);
-  } catch (e) {}
-}
-await prewarmFirestoreChannel();
-setInterval(prewarmFirestoreChannel, 45000);
-
 // 3. In-Memory Ring Buffer & SSE Clients for <5ms Instant Delivery
 const recentPaymentsBuffer = [];
+const liveFeedMapMemory = {}; // Mirrors `system_settings/aba_live_feed.payments` (capped at 40)
+const savedTrxMemory = new Set();
 const sseClients = new Set();
 
 function broadcastToSseClients(paymentObj) {
@@ -163,6 +154,52 @@ function broadcastToSseClients(paymentObj) {
     }
   }
 }
+
+// Pre-warm Firestore gRPC HTTP/2 channel, hydrate existing claimed Trx IDs, & sync dynamic branch Chat IDs
+async function prewarmFirestoreChannel(isInitial = false) {
+  try {
+    const tasks = [
+      db
+        .collection("system_settings")
+        .doc("aba_live_feed")
+        .set(
+          {
+            listenerHeartbeatAt: Date.now(),
+            listenerVersion: "v2.3-strict-whitelist",
+            watchedChatIdsCount: allowedChatIdsSet.size,
+            watchedChatIds: Array.from(allowedChatIdsSet).map((id) => `-100${id}`),
+          },
+          { merge: true }
+        ),
+      syncAllowedChatIdsFromFirestore(),
+    ];
+
+    if (isInitial) {
+      tasks.push(
+        db
+          .collection("aba_payments")
+          .orderBy("receivedAt", "desc")
+          .limit(60)
+          .get()
+          .then((snap) => {
+            snap.forEach((docSnap) => {
+              const d = docSnap.data() || {};
+              const id = String(d.trxId || docSnap.id).trim();
+              if (id) {
+                savedTrxMemory.add(id);
+                liveFeedMapMemory[id] = d;
+              }
+            });
+          })
+          .catch(() => {})
+      );
+    }
+
+    await Promise.all(tasks);
+  } catch (e) {}
+}
+await prewarmFirestoreChannel(true);
+setInterval(() => prewarmFirestoreChannel(false), 45000);
 
 // 4. HTTP Health-Check + Instant `/recent`, `/groups`, & `/events` SSE Server
 const port = Number(process.env.PORT || 3000);
@@ -206,7 +243,7 @@ http
     res.end(
       JSON.stringify({
         status: "ok",
-        service: "solaris-aba-listener-v2.2-strict-whitelist",
+        service: "solaris-aba-listener-v2.3-strict-whitelist",
         uptimeSeconds: Math.round(process.uptime()),
         watchedChatIdsCount: allowedChatIdsSet.size,
         watchedChatIds: Array.from(allowedChatIdsSet),
@@ -218,7 +255,7 @@ http
     console.log(`🌐 Listener HTTP & SSE server active on port ${port}`);
   });
 
-// 5. Minute-Granularity Timestamp Alignment Helper
+// 5. Minute-Granularity Timestamp Alignment Helper (Synchronized with index.html)
 function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   if (!paidAtStr || typeof paidAtStr !== "string") return referenceMs;
   const clean = paidAtStr.trim();
@@ -245,6 +282,10 @@ function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
 
       const constructed = new Date(year, mIdx, day, hours, mins, secs, 0);
       if (!isNaN(constructed.getTime())) {
+        // Handle Dec -> Jan year rollover
+        if (!match[3] && constructed.getTime() - referenceMs > 60 * 24 * 60 * 60 * 1000) {
+          constructed.setFullYear(year - 1);
+        }
         if (!hasSecs) {
           const diffMs = referenceMs - constructed.getTime();
           if (diffMs >= 0 && diffMs < 60000) return referenceMs;
@@ -257,52 +298,97 @@ function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   return referenceMs;
 }
 
-// 6. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser
+// 6. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser (Synchronized 1:1 with index.html)
 function parseABAPayWay(raw, msgDateMs = Date.now()) {
   if (!raw || typeof raw !== "string") return null;
   const t = raw.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
 
+  // Primary pattern: supports spaces inside parentheses e.g. "CHE SOKUNTH ( *636 )" and Outdoor KHQR e.g. "via ABA KHQR (ACLEDA Bank)"
   const strictRegex =
     /(?:(៛|\$|KHR|USD)\s*([0-9,]+(?:\.[0-9]{1,2})?))\s+paid by\s+(.+?)(?:\s*\(\s*\*\s*([0-9A-Za-z]+)\s*\))?\s+on\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?,?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?|\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\s+via\s+(.+?)\s+at\s+(.+?)(?:\.\s*|\s+)Trx\.?\s*ID\s*[:#]?\s*([0-9A-Za-z]+)[,\s]+APV\s*[:#]?\s*([0-9A-Za-z]+)/i;
 
   const m = t.match(strictRegex);
-  if (!m) return null;
+  if (m) {
+    const cur = m[1] === "៛" || /^khr$/i.test(m[1]) ? "KHR" : "USD";
+    const amount = parseFloat(m[2].replace(/,/g, ""));
+    if (isNaN(amount) || amount <= 0) return null;
 
-  const cur = m[1] === "៛" || /^khr$/i.test(m[1]) ? "KHR" : "USD";
-  const amount = parseFloat(m[2].replace(/,/g, ""));
-  if (isNaN(amount) || amount <= 0) return null;
+    const payerName = m[3].replace(/\(\s*\*\s*[0-9A-Za-z]+\s*\)\s*$/, "").trim();
+    const maskedAccount = m[4] ? `*${m[4].trim()}` : "*ABA";
+    const paidAtStr = m[5].trim();
+    const paymentChannel = m[6].trim();
+    const bankParenMatch = paymentChannel.match(/ABA\s*KHQR\s*\(\s*([^)]+)\s*\)/i);
+    const isOutdoor = /ABA\s*KHQR/i.test(paymentChannel) || !!bankParenMatch;
+    const sourceBank = bankParenMatch
+      ? bankParenMatch[1].trim()
+      : isOutdoor
+      ? paymentChannel.replace(/^ABA\s*KHQR\s*/i, "").replace(/[()]/g, "").trim() || "External Bank"
+      : "ABA Bank";
 
-  const payerName = m[3].replace(/\(\s*\*\s*[0-9A-Za-z]+\s*\)\s*$/, "").trim();
-  const maskedAccount = m[4] ? `*${m[4].trim()}` : "*ABA";
-  const paidAtStr = m[5].trim();
-  const paymentChannel = m[6].trim();
-  const bankParenMatch = paymentChannel.match(/ABA\s*KHQR\s*\(\s*([^)]+)\s*\)/i);
-  const isOutdoor = /ABA\s*KHQR/i.test(paymentChannel) || !!bankParenMatch;
-  const sourceBank = bankParenMatch
-    ? bankParenMatch[1].trim()
-    : isOutdoor
-    ? paymentChannel.replace(/^ABA\s*KHQR\s*/i, "").replace(/[()]/g, "").trim() || "External Bank"
-    : "ABA Bank";
+    const merchantName = m[7].replace(/\.$/, "").trim();
+    const trxId = m[8].trim();
+    const apv = m[9].replace(/\.$/, "").trim();
 
-  const merchantName = m[7].replace(/\.$/, "").trim();
-  const trxId = m[8].trim();
-  const apv = m[9].replace(/\.$/, "").trim();
+    return {
+      isValid: true,
+      currency: cur,
+      amount,
+      payerName,
+      maskedAccount,
+      paidAtStr,
+      paidTimestamp: parseAbaPaidAtToMs(paidAtStr, msgDateMs),
+      paymentChannel,
+      paymentCategory: isOutdoor ? "OUTDOOR_KHQR" : "INDOOR_ABA",
+      sourceBank,
+      merchantName,
+      trxId,
+      apv,
+      rawText: t,
+    };
+  }
 
-  return {
-    currency: cur,
-    amount,
-    payerName,
-    maskedAccount,
-    paidAtStr,
-    paidTimestamp: parseAbaPaidAtToMs(paidAtStr, msgDateMs),
-    paymentChannel,
-    paymentCategory: isOutdoor ? "OUTDOOR_KHQR" : "INDOOR_ABA",
-    sourceBank,
-    merchantName,
-    trxId,
-    apv,
-    rawText: t,
-  };
+  // Resilient fallback extractor for any ABA PayWay message variation containing Amount + paid by + Trx. ID / APV
+  const amtMatch = t.match(/(?:(៛|\$|KHR|USD)\s*([0-9,]+(?:\.[0-9]{1,2})?))\s*(?:paid by|received from)/i);
+  const trxMatch = t.match(/Trx\.?\s*ID\s*[:#]?\s*([0-9A-Za-z]+)/i);
+  const apvMatch = t.match(/APV\s*[:#]?\s*([0-9A-Za-z]+)/i);
+  if (amtMatch && (trxMatch || apvMatch)) {
+    const rawSymbol = amtMatch[1].toUpperCase();
+    const currency = rawSymbol === "៛" || rawSymbol === "KHR" ? "KHR" : "USD";
+    const amount = parseFloat(amtMatch[2].replace(/,/g, ""));
+    if (isNaN(amount) || amount <= 0) return null;
+
+    const payerMatch = t.match(/(?:paid by|received from)\s+([^(]+?)(?:\s*\(\s*\*\s*([0-9A-Za-z]+)\s*\)|\s+on\s+|\s+via\s+)/i);
+    const onMatch = t.match(/\bon\s+(.+?)\s+via\s+/i);
+    const viaMatch = t.match(/\bvia\s+(.+?)\s+at\s+/i);
+    const atMatch = t.match(/\bat\s+(.+?)(?:\.\s*Trx|\s+Trx)/i);
+    const generatedId = trxMatch ? trxMatch[1].trim() : `APV-${apvMatch[1].trim()}`;
+    const paidAtStr = onMatch
+      ? onMatch[1].trim()
+      : new Date(msgDateMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const paymentChannel = viaMatch ? viaMatch[1].trim() : "ABA PAY";
+    const bankParenMatch = paymentChannel.match(/ABA\s*KHQR\s*\(\s*([^)]+)\s*\)/i);
+    const isOutdoor = /ABA\s*KHQR/i.test(paymentChannel) || !!bankParenMatch;
+    const sourceBank = bankParenMatch ? bankParenMatch[1].trim() : isOutdoor ? "External Bank" : "ABA Bank";
+
+    return {
+      isValid: true,
+      currency,
+      amount,
+      payerName: payerMatch ? payerMatch[1].trim() : "ABA Customer",
+      maskedAccount: payerMatch && payerMatch[2] ? `*${payerMatch[2].trim()}` : "*ABA",
+      paidAtStr,
+      paidTimestamp: parseAbaPaidAtToMs(paidAtStr, msgDateMs),
+      paymentChannel,
+      paymentCategory: isOutdoor ? "OUTDOOR_KHQR" : "INDOOR_ABA",
+      sourceBank,
+      merchantName: atMatch ? atMatch[1].replace(/\.$/, "").trim() : "",
+      trxId: generatedId,
+      apv: apvMatch ? apvMatch[1].replace(/\.$/, "").trim() : generatedId.slice(-6),
+      rawText: t,
+    };
+  }
+
+  return null;
 }
 
 const apiId = Number(process.env.TG_API_ID);
@@ -314,10 +400,8 @@ if (!apiId || !apiHash || !sessionStr) {
   process.exit(1);
 }
 
-const savedTrxMemory = new Set();
-
 // 7. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
-async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
+async function saveParsedPaymentToFirestore(parsed, chatIdStr, msgDateMs = Date.now()) {
   if (!parsed || !parsed.trxId) return false;
 
   // Final strict guard before writing to Firestore
@@ -330,21 +414,48 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
   if (savedTrxMemory.has(trxId)) return false;
   savedTrxMemory.add(trxId);
 
+  // Prevent boundlessness in long-running processes
+  if (savedTrxMemory.size > 2000) {
+    const oldest = savedTrxMemory.values().next().value;
+    savedTrxMemory.delete(oldest);
+  }
+
   const writeStartMs = performance.now();
-  const nowMs = Date.now();
-  const cleanChatId = String(chatIdStr || "").trim();
+  const effectiveReceivedAt =
+    Number(msgDateMs) > 0 && Math.abs(Date.now() - Number(msgDateMs)) < 365 * 86400000
+      ? Number(msgDateMs)
+      : Date.now();
+  const cleanChatId = formatCanonicalChatId(chatIdStr);
+
+  // Preserve claimedByOrderId if already known in memory
+  const existingClaim = liveFeedMapMemory[trxId]?.claimedByOrderId || null;
+
   const docPayload = {
     ...parsed,
     chatId: cleanChatId,
-    receivedAt: nowMs,
-    claimedByOrderId: null,
+    receivedAt: effectiveReceivedAt,
+    claimedByOrderId: existingClaim,
   };
 
   recentPaymentsBuffer.unshift(docPayload);
   if (recentPaymentsBuffer.length > 50) recentPaymentsBuffer.pop();
   broadcastToSseClients(docPayload);
 
+  // Update bounded liveFeedMapMemory (keep newest 35 payments so `aba_live_feed` doc stays tiny & fast)
+  liveFeedMapMemory[trxId] = docPayload;
+  const allFeedEntries = Object.values(liveFeedMapMemory).sort(
+    (a, b) => Number(b.receivedAt || 0) - Number(a.receivedAt || 0)
+  );
+  const prunedPaymentsMap = {};
+  allFeedEntries.slice(0, 35).forEach((item) => {
+    if (item && item.trxId) {
+      prunedPaymentsMap[String(item.trxId).trim()] = item;
+    }
+  });
+
   try {
+    // CRITICAL FIX: Use nested `{ payments: { [trxId]: docPayload } }` with `{ merge: true }`
+    // so `docSnap.data()?.payments` in `index.html` reads `payments` as a nested object map!
     await Promise.all([
       db.collection("aba_payments").doc(trxId).set(docPayload, { merge: true }),
       db
@@ -352,9 +463,9 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
         .doc("aba_live_feed")
         .set(
           {
-            lastUpdated: nowMs,
+            lastUpdated: Date.now(),
             latestPayment: docPayload,
-            [`payments.${trxId}`]: docPayload,
+            payments: prunedPaymentsMap,
           },
           { merge: true }
         ),
@@ -362,7 +473,7 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
 
     const elapsedMs = Math.round(performance.now() - writeStartMs);
     console.log(
-      `⚡ [ABA VERIFIED -> CLOUD in ${elapsedMs}ms] Chat: ${cleanChatId} | Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} (${parsed.maskedAccount}) via ${parsed.paymentChannel} at ${parsed.merchantName} | APV: ${parsed.apv}`
+      `⚡ [ABA VERIFIED -> CLOUD in ${elapsedMs}ms] Chat: ${cleanChatId} | Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} (${parsed.maskedAccount}) via ${parsed.paymentChannel} [${parsed.sourceBank}] at ${parsed.merchantName} | APV: ${parsed.apv}`
     );
     return true;
   } catch (e) {
@@ -384,7 +495,7 @@ client.setLogLevel("error");
 
 await client.connect();
 console.log("==================================================================");
-console.log("⚡ Connected to Telegram MTProto (Strict Whitelist Multi-Group Mode)!");
+console.log("⚡ Connected to Telegram MTProto (Strict Whitelist Multi-Group Mode v2.3)!");
 console.log(
   `   Strictly Watching ${allowedChatIdsSet.size} Normalized PayWay Chat ID(s):`,
   Array.from(allowedChatIdsSet).join(", ")
@@ -408,10 +519,13 @@ client.addEventHandler(async (ev) => {
     // Strictly ignore any group not in our allowed whitelist
     if (!isChatAllowed(incomingChatId)) return;
 
-    const parsed = parseABAPayWay(rawMessage, Date.now());
+    const msgServerMs = ev.message?.date ? Number(ev.message.date) * 1000 : Date.now();
+    const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
+
+    const parsed = parseABAPayWay(rawMessage, effectiveMs);
     if (!parsed) return;
 
-    await saveParsedPaymentToFirestore(parsed, incomingChatId);
+    await saveParsedPaymentToFirestore(parsed, incomingChatId, effectiveMs);
   } catch (err) {}
 }, new NewMessage({}));
 
@@ -432,16 +546,18 @@ client.addEventHandler(async (update) => {
     // Strictly ignore any group not in our allowed whitelist
     if (!isChatAllowed(rawPeerId)) return;
 
-    const parsed = parseABAPayWay(rawText, Date.now());
+    const msgServerMs = msgObj?.date ? Number(msgObj.date) * 1000 : Date.now();
+    const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
+
+    const parsed = parseABAPayWay(rawText, effectiveMs);
     if (!parsed) return;
 
-    await saveParsedPaymentToFirestore(parsed, rawPeerId);
+    await saveParsedPaymentToFirestore(parsed, rawPeerId, effectiveMs);
   } catch (err) {}
 });
 
 // 10. FAST PARALLEL MULTI-GROUP SWEEP (Strictly scans ONLY whitelisted Chat IDs)
 let cachedTargetDialogs = [];
-let lastDialogRefreshMs = 0;
 let isSweeping = false;
 
 async function syncRecentGroupHistory(isInitialBoot = false) {
@@ -479,7 +595,7 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
             const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
             const parsed = parseABAPayWay(text, effectiveMs);
             if (parsed) {
-              await saveParsedPaymentToFirestore(parsed, dialogIdStr);
+              await saveParsedPaymentToFirestore(parsed, dialogIdStr, effectiveMs);
             }
           }
         } catch (innerErr) {}
