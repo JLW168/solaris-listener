@@ -1,24 +1,29 @@
 /**
- * ABA PayWay Telegram Group Listener Bridge — Strict Whitelist Edition v2.3 (listener-SLR.mjs)
+ * ABA PayWay Telegram Group Listener Bridge — Strict Whitelist & Zero-Overlap Edition v2.4 (listener.mjs)
  * Synchronized 1:1 with Solaris Cafe `index.html` Application Workspace.
  *
- * Key Optimizations:
- *   1. Nested Map Write for `system_settings/aba_live_feed`: Uses `{ payments: { [trxId]: docPayload } }`
- *      with `{ merge: true }` so `docSnap.data()?.payments` in `index.html` reads every transaction
- *      instantly in 0ms (fixes literal dot-key `payments.${trxId}` bug in Firestore `.set()`).
- *   2. Claim-Safe Upsert & Memory Pruning: Preserves existing `claimedByOrderId` if a payment was already
- *      settled by POS/KDS/Customer Portal, and caps `aba_live_feed.payments` to the latest 40 entries
- *      so the single-document live feed never exceeds Firestore's 1MB limit.
- *   3. Unified Indoor ABA PAY + Outdoor Bakong KHQR Parser (with Resilient Fallback):
- *      Matches the exact regex & fallback parser in `window.SolarisKHQREngine.parseABAPayWayMessage`.
- *   4. Strict Multi-Group Whitelist Isolation: Watches ONLY explicitly configured branch `paywayChatId`s.
+ * Root-Cause Fixes for Render `RPCError: 406: AUTH_KEY_DUPLICATED`:
+ *   1. Firestore Lease Handoff (`system_settings/aba_listener_lease`):
+ *      During Render zero-downtime deploys, the new container signals the old container via Firestore
+ *      to disconnect from Telegram FIRST before the new container calls `client.connect()`.
+ *   2. Graceful `SIGTERM` / `SIGINT` Shutdown:
+ *      Cleanly disconnects the MTProto socket when Render stops a container.
+ *   3. Session Revocation Guard (No Crash Loops):
+ *      Detects `AUTH_KEY_DUPLICATED` / `AUTH_KEY_UNREGISTERED` / `SESSION_REVOKED`, reports the exact
+ *      status to Firestore `system_settings/aba_live_feed` and `/`, and avoids hammering Telegram.
+ *   4. Reduced Background Sweep Pressure:
+ *      Relies on instant `NewMessage` push events with a safe 15s fallback sweep to avoid FLOOD_WAIT.
  */
 import http from "node:http";
+import crypto from "node:crypto";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+
+const INSTANCE_ID = `${process.env.RENDER_INSTANCE_ID || "local"}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+const LISTENER_VERSION = "v2.4-zero-overlap";
 
 // 1. Initialize Firebase Admin SDK (Cloud Env or Local serviceAccountKey.json)
 const serviceAccountEnv =
@@ -40,6 +45,15 @@ if (serviceAccountEnv) {
 
 const db = getFirestore();
 db.settings({ ignoreUndefinedProperties: true, preferRest: false });
+
+// Track runtime state for health checks and graceful shutdown
+let listenerStatus = "BOOTING"; // BOOTING | HANDOFF_WAIT | CONNECTED | SESSION_REVOKED | DISCONNECTED_HANDOFF | ERROR
+let lastErrorMsg = null;
+let isShuttingDown = false;
+let client = null;
+let heartbeatInterval = null;
+let sweepInterval = null;
+let leaseUnsub = null;
 
 // 2. Helper to normalize any Telegram Chat ID (strips -100 or - prefix for canonical comparison)
 function normalizeChatId(idInput) {
@@ -77,14 +91,12 @@ function registerAllowedChatIdsFromString(rawStr) {
     .forEach((id) => allowedChatIdsSet.add(id));
 }
 
-// Seed from both DEFAULT_PAYWAY_CHAT_IDS and process.env.PAYWAY_CHAT_ID
 registerAllowedChatIdsFromString(DEFAULT_PAYWAY_CHAT_IDS.join(","));
 registerAllowedChatIdsFromString(rawEnvTargetChats);
 
 let lastDialogRefreshMs = 0;
 
 // Dynamic sync from Firestore `shops` and `payway_secrets`
-// Set PAYWAY_STRICT_ENV_ONLY=true in Render if you want to ignore Firestore Chat IDs completely
 async function syncAllowedChatIdsFromFirestore() {
   if (String(process.env.PAYWAY_STRICT_ENV_ONLY || "").toLowerCase() === "true") {
     return;
@@ -121,14 +133,13 @@ async function syncAllowedChatIdsFromFirestore() {
       console.log(
         `🔄 Synced +${addedCount} new PayWay Chat ID(s) from Firestore! Total watched groups: ${allowedChatIdsSet.size}`
       );
-      lastDialogRefreshMs = 0; // Trigger dialog re-filter on next sweep
+      lastDialogRefreshMs = 0;
     }
   } catch (e) {
     console.warn("Firestore Chat ID sync warning:", e.message);
   }
 }
 
-// Strict Whitelist Verification: Rejects any empty or unlisted Chat ID
 const isChatAllowed = (chatIdStr) => {
   if (String(process.env.PAYWAY_ALLOW_ALL_GROUPS || "").toLowerCase() === "true") {
     return true;
@@ -140,7 +151,7 @@ const isChatAllowed = (chatIdStr) => {
 
 // 3. In-Memory Ring Buffer & SSE Clients for <5ms Instant Delivery
 const recentPaymentsBuffer = [];
-const liveFeedMapMemory = {}; // Mirrors `system_settings/aba_live_feed.payments` (capped at 40)
+const liveFeedMapMemory = {};
 const savedTrxMemory = new Set();
 const sseClients = new Set();
 
@@ -155,24 +166,91 @@ function broadcastToSseClients(paymentObj) {
   }
 }
 
-// Pre-warm Firestore gRPC HTTP/2 channel, hydrate existing claimed Trx IDs, & sync dynamic branch Chat IDs
+// 4. Start HTTP Health-Check & SSE Server IMMEDIATELY (so Render port-binding succeeds before handoff wait)
+const port = Number(process.env.PORT || 3000);
+const httpServer = http
+  .createServer((req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (req.url === "/events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      });
+      res.write(`data: ${JSON.stringify({ type: "CONNECTED", status: listenerStatus, ts: Date.now() })}\n\n`);
+      sseClients.add(res);
+      req.on("close", () => sseClients.delete(res));
+      return;
+    }
+
+    if (req.url === "/recent") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(
+        JSON.stringify({
+          ok: listenerStatus === "CONNECTED",
+          status: listenerStatus,
+          lastError: lastErrorMsg,
+          watchedChatIds: Array.from(allowedChatIdsSet),
+          payments: recentPaymentsBuffer.slice(0, 30),
+        })
+      );
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: listenerStatus === "CONNECTED" ? "ok" : listenerStatus.toLowerCase(),
+        listenerStatus,
+        lastError: lastErrorMsg,
+        instanceId: INSTANCE_ID,
+        service: `solaris-aba-listener-${LISTENER_VERSION}`,
+        uptimeSeconds: Math.round(process.uptime()),
+        watchedChatIdsCount: allowedChatIdsSet.size,
+        watchedChatIds: Array.from(allowedChatIdsSet),
+        cachedPayments: recentPaymentsBuffer.length,
+      })
+    );
+  })
+  .listen(port, () => {
+    console.log(`🌐 Listener HTTP & SSE server active on port ${port} (Instance: ${INSTANCE_ID})`);
+  });
+
+// 5. Status & Heartbeat Publisher to Firestore
+async function publishListenerStatus(statusOverride = null, errorOverride = null) {
+  if (statusOverride) listenerStatus = statusOverride;
+  if (errorOverride !== null) lastErrorMsg = errorOverride;
+  try {
+    await db
+      .collection("system_settings")
+      .doc("aba_live_feed")
+      .set(
+        {
+          listenerHeartbeatAt: Date.now(),
+          listenerVersion: LISTENER_VERSION,
+          listenerInstanceId: INSTANCE_ID,
+          listenerStatus,
+          listenerLastError: lastErrorMsg || null,
+          watchedChatIdsCount: allowedChatIdsSet.size,
+          watchedChatIds: Array.from(allowedChatIdsSet).map((id) => `-100${id}`),
+        },
+        { merge: true }
+      );
+  } catch (e) {}
+}
+
 async function prewarmFirestoreChannel(isInitial = false) {
   try {
-    const tasks = [
-      db
-        .collection("system_settings")
-        .doc("aba_live_feed")
-        .set(
-          {
-            listenerHeartbeatAt: Date.now(),
-            listenerVersion: "v2.3-strict-whitelist",
-            watchedChatIdsCount: allowedChatIdsSet.size,
-            watchedChatIds: Array.from(allowedChatIdsSet).map((id) => `-100${id}`),
-          },
-          { merge: true }
-        ),
-      syncAllowedChatIdsFromFirestore(),
-    ];
+    const tasks = [publishListenerStatus(), syncAllowedChatIdsFromFirestore()];
 
     if (isInitial) {
       tasks.push(
@@ -198,64 +276,8 @@ async function prewarmFirestoreChannel(isInitial = false) {
     await Promise.all(tasks);
   } catch (e) {}
 }
-await prewarmFirestoreChannel(true);
-setInterval(() => prewarmFirestoreChannel(false), 45000);
 
-// 4. HTTP Health-Check + Instant `/recent`, `/groups`, & `/events` SSE Server
-const port = Number(process.env.PORT || 3000);
-http
-  .createServer((req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    if (req.url === "/events") {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-      });
-      res.write(`data: ${JSON.stringify({ type: "CONNECTED", ts: Date.now() })}\n\n`);
-      sseClients.add(res);
-      req.on("close", () => sseClients.delete(res));
-      return;
-    }
-
-    if (req.url === "/recent") {
-      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(
-        JSON.stringify({
-          ok: true,
-          watchedChatIds: Array.from(allowedChatIdsSet),
-          payments: recentPaymentsBuffer.slice(0, 30),
-        })
-      );
-      return;
-    }
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        service: "solaris-aba-listener-v2.3-strict-whitelist",
-        uptimeSeconds: Math.round(process.uptime()),
-        watchedChatIdsCount: allowedChatIdsSet.size,
-        watchedChatIds: Array.from(allowedChatIdsSet),
-        cachedPayments: recentPaymentsBuffer.length,
-      })
-    );
-  })
-  .listen(port, () => {
-    console.log(`🌐 Listener HTTP & SSE server active on port ${port}`);
-  });
-
-// 5. Minute-Granularity Timestamp Alignment Helper (Synchronized with index.html)
+// 6. Minute-Granularity Timestamp Alignment Helper (Synchronized with index.html)
 function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   if (!paidAtStr || typeof paidAtStr !== "string") return referenceMs;
   const clean = paidAtStr.trim();
@@ -282,7 +304,6 @@ function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
 
       const constructed = new Date(year, mIdx, day, hours, mins, secs, 0);
       if (!isNaN(constructed.getTime())) {
-        // Handle Dec -> Jan year rollover
         if (!match[3] && constructed.getTime() - referenceMs > 60 * 24 * 60 * 60 * 1000) {
           constructed.setFullYear(year - 1);
         }
@@ -298,12 +319,11 @@ function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   return referenceMs;
 }
 
-// 6. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser (Synchronized 1:1 with index.html)
+// 7. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser (Synchronized 1:1 with index.html)
 function parseABAPayWay(raw, msgDateMs = Date.now()) {
   if (!raw || typeof raw !== "string") return null;
   const t = raw.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
 
-  // Primary pattern: supports spaces inside parentheses e.g. "CHE SOKUNTH ( *636 )" and Outdoor KHQR e.g. "via ABA KHQR (ACLEDA Bank)"
   const strictRegex =
     /(?:(៛|\$|KHR|USD)\s*([0-9,]+(?:\.[0-9]{1,2})?))\s+paid by\s+(.+?)(?:\s*\(\s*\*\s*([0-9A-Za-z]+)\s*\))?\s+on\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?,?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?|\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\s+via\s+(.+?)\s+at\s+(.+?)(?:\.\s*|\s+)Trx\.?\s*ID\s*[:#]?\s*([0-9A-Za-z]+)[,\s]+APV\s*[:#]?\s*([0-9A-Za-z]+)/i;
 
@@ -347,7 +367,6 @@ function parseABAPayWay(raw, msgDateMs = Date.now()) {
     };
   }
 
-  // Resilient fallback extractor for any ABA PayWay message variation containing Amount + paid by + Trx. ID / APV
   const amtMatch = t.match(/(?:(៛|\$|KHR|USD)\s*([0-9,]+(?:\.[0-9]{1,2})?))\s*(?:paid by|received from)/i);
   const trxMatch = t.match(/Trx\.?\s*ID\s*[:#]?\s*([0-9A-Za-z]+)/i);
   const apvMatch = t.match(/APV\s*[:#]?\s*([0-9A-Za-z]+)/i);
@@ -391,30 +410,15 @@ function parseABAPayWay(raw, msgDateMs = Date.now()) {
   return null;
 }
 
-const apiId = Number(process.env.TG_API_ID);
-const apiHash = String(process.env.TG_API_HASH || "").trim();
-const sessionStr = String(process.env.TG_SESSION || "").trim();
-
-if (!apiId || !apiHash || !sessionStr) {
-  console.error("Missing TG_API_ID, TG_API_HASH, or TG_SESSION in environment variables.");
-  process.exit(1);
-}
-
-// 7. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
+// 8. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
 async function saveParsedPaymentToFirestore(parsed, chatIdStr, msgDateMs = Date.now()) {
   if (!parsed || !parsed.trxId) return false;
-
-  // Final strict guard before writing to Firestore
-  if (!isChatAllowed(chatIdStr)) {
-    return false;
-  }
+  if (!isChatAllowed(chatIdStr)) return false;
 
   const trxId = String(parsed.trxId).trim();
-
   if (savedTrxMemory.has(trxId)) return false;
   savedTrxMemory.add(trxId);
 
-  // Prevent boundlessness in long-running processes
   if (savedTrxMemory.size > 2000) {
     const oldest = savedTrxMemory.values().next().value;
     savedTrxMemory.delete(oldest);
@@ -427,7 +431,6 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr, msgDateMs = Date.
       : Date.now();
   const cleanChatId = formatCanonicalChatId(chatIdStr);
 
-  // Preserve claimedByOrderId if already known in memory
   const existingClaim = liveFeedMapMemory[trxId]?.claimedByOrderId || null;
 
   const docPayload = {
@@ -441,7 +444,6 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr, msgDateMs = Date.
   if (recentPaymentsBuffer.length > 50) recentPaymentsBuffer.pop();
   broadcastToSseClients(docPayload);
 
-  // Update bounded liveFeedMapMemory (keep newest 35 payments so `aba_live_feed` doc stays tiny & fast)
   liveFeedMapMemory[trxId] = docPayload;
   const allFeedEntries = Object.values(liveFeedMapMemory).sort(
     (a, b) => Number(b.receivedAt || 0) - Number(a.receivedAt || 0)
@@ -454,8 +456,6 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr, msgDateMs = Date.
   });
 
   try {
-    // CRITICAL FIX: Use nested `{ payments: { [trxId]: docPayload } }` with `{ merge: true }`
-    // so `docSnap.data()?.payments` in `index.html` reads `payments` as a nested object map!
     await Promise.all([
       db.collection("aba_payments").doc(trxId).set(docPayload, { merge: true }),
       db
@@ -483,132 +483,297 @@ async function saveParsedPaymentToFirestore(parsed, chatIdStr, msgDateMs = Date.
   }
 }
 
-// 8. Use Native TCP Transport in Node.js (useWSS: false) for lowest latency
-const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
-  connectionRetries: 10,
-  retryDelay: 1000,
-  autoReconnect: true,
-  useWSS: false,
-});
+// 9. Graceful Disconnect & Shutdown Routine (Prevents AUTH_KEY_DUPLICATED on Render rolling deploys)
+async function disconnectTelegramCleanly(reason = "SHUTDOWN") {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
 
-client.setLogLevel("error");
-
-await client.connect();
-console.log("==================================================================");
-console.log("⚡ Connected to Telegram MTProto (Strict Whitelist Multi-Group Mode v2.3)!");
-console.log(
-  `   Strictly Watching ${allowedChatIdsSet.size} Normalized PayWay Chat ID(s):`,
-  Array.from(allowedChatIdsSet).join(", ")
-);
-console.log("==================================================================");
-
-// 9A. REAL-TIME EVENT LISTENER (Strictly ignores unlisted groups)
-client.addEventHandler(async (ev) => {
-  try {
-    const rawMessage = ev.message?.message || ev.message?.text || "";
-    if (!rawMessage) return;
-
-    const peer = ev.message?.peerId;
-    const rawPeerId =
-      ev.chatId ||
-      ev.message?.chatId ||
-      (peer?.channelId ? `-100${peer.channelId}` : peer?.chatId ? `-${peer.chatId}` : "");
-
-    const incomingChatId = String(rawPeerId || "");
-
-    // Strictly ignore any group not in our allowed whitelist
-    if (!isChatAllowed(incomingChatId)) return;
-
-    const msgServerMs = ev.message?.date ? Number(ev.message.date) * 1000 : Date.now();
-    const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
-
-    const parsed = parseABAPayWay(rawMessage, effectiveMs);
-    if (!parsed) return;
-
-    await saveParsedPaymentToFirestore(parsed, incomingChatId, effectiveMs);
-  } catch (err) {}
-}, new NewMessage({}));
-
-// 9B. RAW MTPROTO UPDATE FALLBACK (Strictly ignores unlisted groups)
-client.addEventHandler(async (update) => {
-  try {
-    const msgObj = update?.message || update?.newMessage?.message;
-    const rawText = typeof msgObj === "string" ? msgObj : msgObj?.message || msgObj?.text || "";
-    if (!rawText) return;
-
-    const peer = msgObj?.peerId || update?.peerId;
-    const rawPeerId = peer?.channelId
-      ? `-100${peer.channelId}`
-      : peer?.chatId
-      ? `-${peer.chatId}`
-      : "";
-
-    // Strictly ignore any group not in our allowed whitelist
-    if (!isChatAllowed(rawPeerId)) return;
-
-    const msgServerMs = msgObj?.date ? Number(msgObj.date) * 1000 : Date.now();
-    const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
-
-    const parsed = parseABAPayWay(rawText, effectiveMs);
-    if (!parsed) return;
-
-    await saveParsedPaymentToFirestore(parsed, rawPeerId, effectiveMs);
-  } catch (err) {}
-});
-
-// 10. FAST PARALLEL MULTI-GROUP SWEEP (Strictly scans ONLY whitelisted Chat IDs)
-let cachedTargetDialogs = [];
-let isSweeping = false;
-
-async function syncRecentGroupHistory(isInitialBoot = false) {
-  if (isSweeping) return;
-  isSweeping = true;
-  try {
-    const now = Date.now();
-    // Refresh dialog list every 3 minutes or on boot
-    if (isInitialBoot || cachedTargetDialogs.length === 0 || now - lastDialogRefreshMs > 180000) {
-      const dialogs = await client.getDialogs({ limit: 100 });
-      cachedTargetDialogs = dialogs.filter((d) => {
-        const dialogIdStr = String(d.id || "");
-        return (d.isGroup || d.isChannel) && isChatAllowed(dialogIdStr);
-      });
-      lastDialogRefreshMs = now;
-      if (isInitialBoot) {
-        console.log(
-          `📡 Active Dialog Sweep strictly locked onto ${cachedTargetDialogs.length} Whitelisted Group(s):`,
-          cachedTargetDialogs.map((d) => `${d.title} (${d.id})`).join(" | ")
-        );
-      }
-    }
-
-    await Promise.all(
-      cachedTargetDialogs.map(async (d) => {
-        try {
-          const dialogIdStr = String(d.id || "");
-          if (!isChatAllowed(dialogIdStr)) return;
-
-          const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 12 : 4 });
-          for (const msg of messages) {
-            const text = msg?.message || msg?.text || "";
-            if (!text) continue;
-            const msgServerMs = msg.date ? Number(msg.date) * 1000 : Date.now();
-            const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
-            const parsed = parseABAPayWay(text, effectiveMs);
-            if (parsed) {
-              await saveParsedPaymentToFirestore(parsed, dialogIdStr, effectiveMs);
-            }
-          }
-        } catch (innerErr) {}
-      })
-    );
-  } catch (err) {
-    if (!/RPCError|INTERNAL|FLOOD/i.test(err.message || "")) {
-      console.warn("History sweep warning:", err.message || err);
-    }
-  } finally {
-    isSweeping = false;
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  if (sweepInterval) clearInterval(sweepInterval);
+  if (typeof leaseUnsub === "function") {
+    leaseUnsub();
+    leaseUnsub = null;
   }
+
+  console.log(`🛑 Disconnecting Telegram MTProto cleanly (${reason})...`);
+  try {
+    if (client) {
+      await client.disconnect();
+      client = null;
+    }
+  } catch (e) {}
+
+  try {
+    await db
+      .collection("system_settings")
+      .doc("aba_listener_lease")
+      .set(
+        {
+          lastDisconnectedInstanceId: INSTANCE_ID,
+          lastDisconnectedAt: Date.now(),
+        },
+        { merge: true }
+      );
+  } catch (e) {}
 }
 
-await syncRecentGroupHistory(true);
-setInterval(() => syncRecentGroupHistory(false), 3500);
+process.on("SIGTERM", async () => {
+  await disconnectTelegramCleanly("RENDER_SIGTERM");
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000);
+});
+
+process.on("SIGINT", async () => {
+  await disconnectTelegramCleanly("SIGINT");
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000);
+});
+
+// Catch fatal GramJS auth errors cleanly without infinite crash loops
+async function handleFatalAuthError(err) {
+  const msg = String(err?.errorMessage || err?.message || err || "");
+  if (/AUTH_KEY_DUPLICATED|AUTH_KEY_UNREGISTERED|SESSION_REVOKED|USER_DEACTIVATED/i.test(msg)) {
+    console.error("==================================================================");
+    console.error(`❌ TELEGRAM SESSION ERROR: ${msg}`);
+    console.error("   ACTION REQUIRED:");
+    console.error("   1. Generate a brand-new TG_SESSION by running `node login.mjs` ONCE.");
+    console.error("   2. Update TG_SESSION in Render Environment Variables and Redeploy.");
+    console.error("   3. NEVER use the same TG_SESSION in a browser or second server at the same time.");
+    console.error("==================================================================");
+    await publishListenerStatus("SESSION_REVOKED", `${msg}: Generate a fresh TG_SESSION with login.mjs and update Render env.`);
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    if (sweepInterval) clearInterval(sweepInterval);
+    try {
+      if (client) await client.disconnect();
+    } catch (e) {}
+    return true;
+  }
+  return false;
+}
+
+process.on("unhandledRejection", async (reason) => {
+  const handled = await handleFatalAuthError(reason);
+  if (!handled) console.error("Unhandled Promise Rejection:", reason);
+});
+
+process.on("uncaughtException", async (err) => {
+  const handled = await handleFatalAuthError(err);
+  if (!handled) console.error("Uncaught Exception:", err);
+});
+
+// 10. Zero-Overlap Render Deploy Handoff via Firestore Lease
+async function acquireSingleActiveLease() {
+  const leaseRef = db.collection("system_settings").doc("aba_listener_lease");
+  listenerStatus = "HANDOFF_WAIT";
+
+  let previousInstanceId = null;
+  let previousWasRecent = false;
+  try {
+    const snap = await leaseRef.get();
+    if (snap.exists) {
+      const d = snap.data() || {};
+      if (d.activeInstanceId && d.activeInstanceId !== INSTANCE_ID) {
+        previousInstanceId = d.activeInstanceId;
+        previousWasRecent = Date.now() - Number(d.updatedAt || 0) < 120000;
+      }
+    }
+  } catch (e) {}
+
+  // Claim the active lease so any older Render container disconnects immediately
+  await leaseRef.set(
+    {
+      activeInstanceId: INSTANCE_ID,
+      updatedAt: Date.now(),
+    },
+    { merge: true }
+  );
+
+  // If a previous container was recently active, wait up to 4.5s for it to confirm disconnect
+  if (previousInstanceId && previousWasRecent) {
+    console.log(`⏳ Waiting for previous instance (${previousInstanceId}) to release Telegram session...`);
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < 4500) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const checkSnap = await leaseRef.get();
+        if (checkSnap.exists && checkSnap.data()?.lastDisconnectedInstanceId === previousInstanceId) {
+          console.log(`✅ Previous instance (${previousInstanceId}) disconnected cleanly in ${Date.now() - waitStart}ms!`);
+          break;
+        }
+      } catch (e) {}
+    }
+  }
+
+  // Listen for future newer deployments taking over the lease
+  leaseUnsub = leaseRef.onSnapshot(
+    async (snap) => {
+      if (!snap.exists || isShuttingDown) return;
+      const d = snap.data() || {};
+      if (d.activeInstanceId && d.activeInstanceId !== INSTANCE_ID) {
+        console.log(`🔁 Newer instance (${d.activeInstanceId}) took over lease. Yielding Telegram connection...`);
+        listenerStatus = "DISCONNECTED_HANDOFF";
+        await disconnectTelegramCleanly("LEASE_YIELDED_TO_NEW_DEPLOY");
+      }
+    },
+    () => {}
+  );
+}
+
+// 11. Main Boot Sequence
+const apiId = Number(process.env.TG_API_ID);
+const apiHash = String(process.env.TG_API_HASH || "").trim();
+const sessionStr = String(process.env.TG_SESSION || "").trim();
+
+if (!apiId || !apiHash || !sessionStr) {
+  console.error("Missing TG_API_ID, TG_API_HASH, or TG_SESSION in environment variables.");
+  await publishListenerStatus("ERROR", "Missing TG_API_ID, TG_API_HASH, or TG_SESSION.");
+} else {
+  await prewarmFirestoreChannel(true);
+  await acquireSingleActiveLease();
+
+  if (!isShuttingDown) {
+    client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
+      connectionRetries: 5,
+      retryDelay: 2000,
+      autoReconnect: true,
+      useWSS: false,
+    });
+
+    client.setLogLevel("error");
+
+    try {
+      await client.connect();
+      const isAuth = await client.checkAuthorization();
+      if (!isAuth) {
+        throw new Error("AUTH_KEY_UNREGISTERED: TG_SESSION is not authorized.");
+      }
+
+      await publishListenerStatus("CONNECTED", "");
+      console.log("==================================================================");
+      console.log(`⚡ Connected to Telegram MTProto (${LISTENER_VERSION} | Instance: ${INSTANCE_ID})!`);
+      console.log(
+        `   Strictly Watching ${allowedChatIdsSet.size} Normalized PayWay Chat ID(s):`,
+        Array.from(allowedChatIdsSet).join(", ")
+      );
+      console.log("==================================================================");
+
+      // REAL-TIME EVENT LISTENER (Instant Push)
+      client.addEventHandler(async (ev) => {
+        try {
+          if (isShuttingDown) return;
+          const rawMessage = ev.message?.message || ev.message?.text || "";
+          if (!rawMessage) return;
+
+          const peer = ev.message?.peerId;
+          const rawPeerId =
+            ev.chatId ||
+            ev.message?.chatId ||
+            (peer?.channelId ? `-100${peer.channelId}` : peer?.chatId ? `-${peer.chatId}` : "");
+
+          const incomingChatId = String(rawPeerId || "");
+          if (!isChatAllowed(incomingChatId)) return;
+
+          const msgServerMs = ev.message?.date ? Number(ev.message.date) * 1000 : Date.now();
+          const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
+
+          const parsed = parseABAPayWay(rawMessage, effectiveMs);
+          if (!parsed) return;
+
+          await saveParsedPaymentToFirestore(parsed, incomingChatId, effectiveMs);
+        } catch (err) {}
+      }, new NewMessage({}));
+
+      // RAW MTPROTO UPDATE FALLBACK
+      client.addEventHandler(async (update) => {
+        try {
+          if (isShuttingDown) return;
+          const msgObj = update?.message || update?.newMessage?.message;
+          const rawText = typeof msgObj === "string" ? msgObj : msgObj?.message || msgObj?.text || "";
+          if (!rawText) return;
+
+          const peer = msgObj?.peerId || update?.peerId;
+          const rawPeerId = peer?.channelId
+            ? `-100${peer.channelId}`
+            : peer?.chatId
+            ? `-${peer.chatId}`
+            : "";
+
+          if (!isChatAllowed(rawPeerId)) return;
+
+          const msgServerMs = msgObj?.date ? Number(msgObj.date) * 1000 : Date.now();
+          const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
+
+          const parsed = parseABAPayWay(rawText, effectiveMs);
+          if (!parsed) return;
+
+          await saveParsedPaymentToFirestore(parsed, rawPeerId, effectiveMs);
+        } catch (err) {}
+      });
+
+      // SAFETY-NET HISTORY SWEEP (Every 15s to prevent FLOOD_WAIT while catching any missed messages)
+      let cachedTargetDialogs = [];
+      let isSweeping = false;
+
+      async function syncRecentGroupHistory(isInitialBoot = false) {
+        if (isSweeping || isShuttingDown || !client) return;
+        isSweeping = true;
+        try {
+          const now = Date.now();
+          if (isInitialBoot || cachedTargetDialogs.length === 0 || now - lastDialogRefreshMs > 180000) {
+            const dialogs = await client.getDialogs({ limit: 100 });
+            cachedTargetDialogs = dialogs.filter((d) => {
+              const dialogIdStr = String(d.id || "");
+              return (d.isGroup || d.isChannel) && isChatAllowed(dialogIdStr);
+            });
+            lastDialogRefreshMs = now;
+            if (isInitialBoot) {
+              console.log(
+                `📡 Active Dialog Sweep strictly locked onto ${cachedTargetDialogs.length} Whitelisted Group(s):`,
+                cachedTargetDialogs.map((d) => `${d.title} (${d.id})`).join(" | ")
+              );
+            }
+          }
+
+          await Promise.all(
+            cachedTargetDialogs.map(async (d) => {
+              try {
+                if (isShuttingDown || !client) return;
+                const dialogIdStr = String(d.id || "");
+                if (!isChatAllowed(dialogIdStr)) return;
+
+                const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 12 : 4 });
+                for (const msg of messages) {
+                  const text = msg?.message || msg?.text || "";
+                  if (!text) continue;
+                  const msgServerMs = msg.date ? Number(msg.date) * 1000 : Date.now();
+                  const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
+                  const parsed = parseABAPayWay(text, effectiveMs);
+                  if (parsed) {
+                    await saveParsedPaymentToFirestore(parsed, dialogIdStr, effectiveMs);
+                  }
+                }
+              } catch (innerErr) {}
+            })
+          );
+        } catch (err) {
+          const wasFatal = await handleFatalAuthError(err);
+          if (!wasFatal && !/RPCError|INTERNAL|FLOOD/i.test(err.message || "")) {
+            console.warn("History sweep warning:", err.message || err);
+          }
+        } finally {
+          isSweeping = false;
+        }
+      }
+
+      await syncRecentGroupHistory(true);
+      sweepInterval = setInterval(() => syncRecentGroupHistory(false), 15000);
+      heartbeatInterval = setInterval(() => prewarmFirestoreChannel(false), 45000);
+    } catch (connectErr) {
+      const handled = await handleFatalAuthError(connectErr);
+      if (!handled) {
+        console.error("Telegram connection error:", connectErr.message || connectErr);
+        await publishListenerStatus("ERROR", connectErr.message || String(connectErr));
+      }
+    }
+  }
+}
